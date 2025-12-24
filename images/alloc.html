@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px 10px 22px 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {position: fixed; bottom: 0; margin: 0; padding: 2px 3px 2px 3px; outline: 1px solid #ffc000; display: none; overflow: hidden; white-space: nowrap; background-color: #ffffe0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {left: 0}
+	#match {right: 0}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 1024px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Allocation profile</h1>
+<header style='text-align: left'><button id='inverted' title='Invert'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/async-profiler/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='status'></p>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<script>
+	// Copyright The async-profiler authors
+	// SPDX-License-Identifier: Apache-2.0
+	'use strict';
+	let root, px, pattern;
+	let level0 = 0, left0 = 0, width0 = 0;
+	let nav = [], navIndex, matchval;
+	let inverted = false;
+	const levels = Array(64);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(key, level, left, width, inln, c1, int) {
+		levels[level0 = level].push({level, left: left0 += left, width: width0 = width || width0,
+			color: getColor(palette[key & 7]), title: cpool[key >>> 3],
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function u(key, width, inln, c1, int) {
+		f(key, level0 + 1, 0, width, inln, c1, int)
+	}
+
+	function n(key, width, inln, c1, int) {
+		f(key, level0, width0, width, inln, c1, int)
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function removeStack(left, width) {
+		for (let h = 0; h < levels.length; h++) {
+			const frames = levels[h], newFrames = [];
+			for (let i = 0; i < frames.length; i++) {
+				const f = frames[i];
+				if (f.left >= left + width) {
+					f.left -= width;
+				} else if (f.left + f.width > left) {
+					if ((f.width -= width) <= 0 && h) continue;
+				}
+				newFrames.push(f);
+			}
+			levels[h] = newFrames;
+		}
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, nav = []);
+		navIndex = -1;
+		document.getElementById('matchval').textContent = matchval = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inline-block' : 'none';
+	}
+
+	function render(newRoot, nav) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] || (marked[f.left] = f);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					const m = marked[x];
+					if (nav) nav.push(m);
+					total += m.width;
+					left = +x + m.width;
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (f.level < root.level) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = inverted ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	function unpack(cpool) {
+		for (let i = 1; i < cpool.length; i++) {
+			cpool[i] = cpool[i - 1].substring(0, cpool[i].charCodeAt(0) - 32) + cpool[i].substring(1);
+		}
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((inverted ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f !== root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((inverted ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (event.altKey && h >= root.level) {
+						removeStack(f.left, f.width);
+						root.width > f.width ? render(root) : render();
+					} else if (f !== root) {
+						render(f);
+					}
+					canvas.onmousemove();
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				status.style.display = 'inline-block';
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.style.display = 'none';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = null;
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('inverted').onclick = function() {
+		inverted = !inverted;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function(event) {
+		if ((event.ctrlKey || event.metaKey) && event.key === 'f') {
+			event.preventDefault();
+			search(true);
+		} else if (event.key === 'Escape') {
+			search(false);
+		} else if ((event.key === 'n' || event.key === 'N') && nav.length > 0) {
+			navIndex = (navIndex + (event.shiftKey ? nav.length - 1 : 1)) % nav.length;
+			render(nav[navIndex]);
+			document.getElementById('matchval').textContent = matchval + ' (' + (navIndex + 1) + ' of ' + nav.length + ')';
+			window.scroll(0, inverted ? root.level * 16 : canvasHeight - (root.level + 1) * 16);
+			canvas.onmousemove();
+		}
+	}
+
+const cpool = [
+'all',
+' byte[]',
+' char[]',
+'!om/example/demo/controller/MyController.getServiceLastPing',
+'1model/ServiceStorage.generatePings',
+'1service/MyService.getLastPingOfServer',
+' jakarta/servlet/http/HttpServlet.service',
+'"va.lang.Long',
+'*Object[]',
+'*String',
+'*ThreadLocal$ThreadLocalMap$Entry',
+'*annotation.Annotation[]',
+'%nio.HeapByteBuffer',
+'%time.Instant',
+'%util.ArrayList',
+'*HashMap',
+'1$Node',
+'6[]',
+'*TreeMap$KeyIterator',
+'$/io/OutputStream.write',
+'%lang/Long.valueOf',
+'*Object.clone',
+'*String.<init>',
+'1toLowerCase',
+'0ConcatHelper.newArray',
+'EWithSuffix',
+'@String',
+'=simpleConcat',
+'0Latin1.toLowerCase',
+'0UTF16.compress',
+'*Thread.run',
+'4With',
+'0Local$ThreadLocalMap.set',
+'5.set',
+'*invoke/DirectMethodHandle$Holder.invokeStatic',
+'1Invokers$Holder.invokeExact_MT',
+'AlinkToTargetMethod',
+'1LambdaForm$DMH.0x00000c0001114400.invokeVirtual',
+'<MH.0x00000c000102e800.invoke',
+'L81000.invoke',
+'K319800.invoke',
+'L94400.invoke',
+'Ld4c00.linkToTargetMethod',
+'M5000.invoke',
+'*reflect/Method.invoke',
+'%nio/CharBuffer.allocate',
+')HeapByteBuffer.slice',
+'-CharBuffer.<init>',
+')charset/CharsetDecoder.decode',
+'%time/Clock.currentInstant',
+'*Instant.create',
+'2now',
+'2ofEpochSecond',
+'%util/ArrayList.add',
+'4grow',
+'/s.copyOf',
+'*HashMap.newNode',
+'2put',
+'5Val',
+'2resize',
+'*TreeMap$KeySet.iterator',
+'1.keyIterator',
+'.Set.iterator',
+'!dk/internal/misc/Unsafe.allocateUninitializedArray',
+'S0',
+'-reflect/DirectMethodHandleAccessor.invoke',
+'VImpl',
+' org.apache.tomcat.util.http.parser.Host$MessageBytesReader',
+'7net.NioEndpoint$NioSocketWrapper',
+'$springframework.util.LinkedCaseInsensitiveMap$1',
+'#/apache/catalina/authenticator/AuthenticatorBase.invoke',
+'4connector/CoyoteAdapter.asyncDispatch',
+'Lservice',
+'DOutputStream.write',
+'>OutputBuffer.close',
+'KdoFlush',
+'KflushByteBuffer',
+'KupdateBytesWritten',
+'Kwrite',
+'PBytes',
+'>Request.doParseParameters',
+'FgetParameterValues',
+'IRequestURI',
+'FparseParameters',
+'EFacade.getParameterValues',
+'ORequestURI',
+'6re/ApplicationDispatcher.dispatch',
+'Oinvoke',
+'DFilterChain.doFilter',
+':syncContextImpl$AsyncRunnable.run',
+'I.doInternalDispatch',
+'9StandardContextValve.invoke',
+'AEngineValve.invoke',
+'AHostValve.invoke',
+'AWrapperValve.invoke',
+'4valves/ErrorReportValve.invoke',
+',oyote/AbstractProcessor.dispatch',
+'DparseHost',
+'CLight.process',
+'=tocol$ConnectionHandler.process',
+'2Request.markStartTime',
+'2http11/Http11InputBuffer.parseRequestLine',
+'?Processor.prepareRequest',
+'Iservice',
+'+tomcat/util/buf/ByteChunk.toString',
+'MInternal',
+';MessageBytes.toStringType',
+';StringCache.toString',
+'7http/Parameters.handleQueryParameters',
+'GprocessParameters',
+'<parser/Host.parse',
+'7net/Acceptor.run',
+';NioEndpoint$SocketProcessor.doRun',
+'F.setSocketOptions',
+';SocketProcessorBase.run',
+'7threads/TaskThread$WrappingRunnable.run',
+'@hreadPoolExecutor$Worker.run',
+'Q.runWorker',
+'2websocket/server/WsFilter.doFilter',
+'$springframework/beans/TypeConverterDelegate.convertIfNecessary',
+'GSupport.convertIfNecessary',
+'4core/annotation/AnnotatedElementAdapter.getAnnotations',
+'9convert/TypeDescriptor.annotationsMatch',
+'Pequals',
+'PgetAnnotations',
+'Asupport/GenericConversionService$ConverterCacheKey.equals',
+'a.canConvert',
+'bgetConverter',
+'4http/HttpHeaders$CaseInsensitiveEntrySet.<init>',
+'THeaderNameSet.<init>',
+'D.forEach',
+'Eget',
+'EheaderSet',
+'9converter/AbstractHttpMessageConverter.addDefaultHeaders',
+'`write',
+'CStringHttpMessageConverter.addDefaultHeaders',
+'^writeInternal',
+'9server/DefaultPathContainer.createFromUrlPath',
+'GRequestPath.<init>',
+'@PathContainer.parsePath',
+'@RequestPath.parse',
+'@ServletServerHttpResponse$ServletResponseHttpHeaders.containsHeader',
+'uget',
+'Y.getBody',
+'ZwriteHeaders',
+'4util/ConcurrentReferenceHashMap$Segment.findInChain',
+'\\getReference',
+'S.get',
+'WReference',
+'9LinkedCaseInsensitiveMap.<init>',
+'RconvertKey',
+'Rget',
+'9MultiValueMapAdapter.get',
+'9ObjectUtils.nullSafeEquals',
+'9StreamUtils.copy',
+'4validation/DataBinder.convertIfNecessary',
+'4web/context/request/RequestContextHolder.setRequestAttributes',
+'HServletWebRequest.getParameterValues',
+'Hasync/StandardServletAsyncWebRequest$LifecycleServletOutputStream.write',
+'NWebAsyncManager.startDeferredResultProcessing',
+'8filter/CharacterEncodingFilter.doFilterInternal',
+'?FormContentFilter.doFilterInternal',
+'?OncePerRequestFilter.doFilter',
+'TgetAlreadyFilteredAttributeName',
+'?RequestContextFilter.doFilterInternal',
+'TinitContextHolders',
+'8method/annotation/AbstractNamedValueMethodArgumentResolver.convertIfNecessary',
+'sresolveArgument',
+'JRequestParamMethodArgumentResolver.resolveName',
+'?support/HandlerMethodArgumentResolverComposite.resolveArgument',
+'TReturnValueHandlerComposite.handleReturnValue',
+'GInvocableHandlerMethod.doInvoke',
+'^getMethodArgumentValues',
+'^invokeForRequest',
+'8servlet/DispatcherServlet.doDispatch',
+'TService',
+'RgetHandler',
+'@FrameworkServlet.doGet',
+'QprocessRequest',
+'Qservice',
+'@handler/AbstractHandlerMapping.getHandler',
+'XethodMapping.addMatchingMappings',
+'egetHandlerInternal',
+'elookupHandlerMethod',
+'@mvc/condition/PathPatternsRequestCondition.getMatchingCondition',
+'vPatterns',
+'Dmethod/AbstractHandlerMethodAdapter.handle',
+'KRequestMappingInfo.getMatchingCondition',
+']HandlerMapping.getHandlerInternal',
+'oMatchingMapping',
+'Kannotation/AbstractMessageConverterMethodProcessor.writeWithMessageConverters',
+'VReactiveTypeHandler.handleValue',
+'XquestMappingHandlerAdapter.handleInternal',
+'sinvokeHandlerMethod',
+']ResponseBodyMethodProcessor.handleReturnValue',
+'XsponseBodyEmitterReturnValueHandler.handleReturnValue',
+'VServletInvocableHandlerMethod.invokeAndHandle',
+'8util/ServletRequestPathUtils$ServletRequestPath.parse',
+'T.parseAndCache'
+];
+unpack(cpool);
+
+n(3,11731)
+u(241)
+u(249)
+u(889,1)
+u(905)
+u(905)
+u(546)
+f(921,3,1,11730)
+u(929)
+u(937)
+u(913)
+u(897)
+u(793)
+u(785)
+u(769,6)
+u(569)
+u(737)
+u(761)
+u(745)
+u(561)
+u(729)
+u(753)
+u(721)
+u(713)
+u(689)
+u(697)
+u(705)
+u(1297)
+u(705,5)
+u(1297)
+u(705)
+u(1297)
+u(1313)
+u(705,4)
+u(49)
+u(1433)
+u(49)
+u(1417)
+u(1425)
+u(1401)
+u(1393)
+u(1409,1)
+u(1441)
+u(1505)
+u(1505)
+u(1457)
+u(1465)
+u(1449)
+u(1513)
+u(1513)
+u(1497)
+u(1473)
+u(1481)
+u(497)
+u(481)
+u(489)
+u(146)
+f(1489,37,1,3)
+u(1537)
+u(1545)
+u(1569)
+u(1361)
+u(1553)
+u(1521)
+u(1073)
+u(1081,1)
+u(1081)
+u(1065)
+u(1129)
+u(1137)
+u(1049)
+u(1217)
+u(1217)
+u(1209)
+u(1201)
+u(185)
+u(225)
+u(10)
+f(1089,45,1,2)
+u(1089)
+u(1145,1)
+u(1153)
+u(1041)
+u(1057)
+u(1025)
+u(1033)
+u(1193)
+u(554)
+f(1233,47,1)
+u(153)
+u(1265)
+u(1265)
+u(585)
+u(625)
+u(633)
+u(617)
+u(593)
+u(601)
+u(609)
+u(369)
+u(98)
+f(1321,29,1)
+u(1249)
+u(265)
+u(265)
+u(257)
+u(82)
+f(1305,24,1)
+u(289)
+u(313)
+u(273)
+u(217)
+u(193)
+u(505)
+u(513)
+u(10)
+f(825,10,1,11724)
+u(577,11715)
+u(737)
+u(761)
+u(745)
+u(561)
+u(729)
+u(753)
+u(705)
+u(1297)
+u(1281)
+u(705)
+u(1297)
+u(1289)
+u(705)
+u(1297)
+u(1313)
+u(705)
+u(945)
+u(705)
+u(49)
+u(1433)
+u(49)
+u(1417)
+u(1425)
+u(1401)
+u(1393,11713)
+u(1489)
+u(1537)
+u(1545)
+u(1569)
+u(1361,1)
+u(1561)
+u(1529)
+u(1273)
+u(425)
+u(425)
+u(433)
+u(433)
+u(66)
+f(1385,41,1,11712)
+u(1369,11710)
+u(353)
+u(521)
+u(529)
+u(281)
+u(329)
+u(297)
+u(25)
+u(41)
+u(33,11704)
+u(122,1851)
+n(161,1816)
+u(58)
+f(289,52,1816,2148)
+u(321)
+u(273)
+u(193,1239)
+u(505)
+u(513)
+u(10)
+f(209,55,1239,909)
+u(74)
+f(425,52,909,358)
+u(425)
+u(433)
+u(433)
+u(66,1)
+n(441,357)
+u(441)
+u(66)
+f(457,52,357,5531)
+u(465)
+u(449,2478)
+u(130)
+f(473,54,2478,3053)
+u(138)
+f(337,51,3053,6)
+u(345)
+u(305)
+u(273)
+u(201)
+u(193)
+u(505)
+u(513)
+u(10)
+f(1377,42,6,2)
+u(1353)
+u(1337)
+u(1329,1)
+u(1241)
+u(961)
+u(961)
+u(953)
+u(1009)
+u(1017)
+u(1177)
+u(1185)
+u(1169)
+u(1161)
+u(1225)
+u(1001)
+u(985)
+u(977)
+u(993)
+u(969)
+u(169)
+u(90)
+f(1345,45,1)
+u(1257)
+u(673)
+u(649)
+u(665)
+u(641)
+u(865)
+u(873)
+u(873)
+u(833)
+u(857)
+u(841)
+u(385)
+u(361)
+u(377)
+u(18)
+f(1585,36,1,2)
+u(1577)
+u(681,1)
+u(657)
+u(849)
+u(833)
+u(833)
+u(857)
+u(841)
+u(177)
+u(177)
+u(233)
+u(10)
+f(1121,38,1)
+u(1105)
+u(1113)
+u(1097)
+u(114)
+f(809,11,1,8)
+u(801)
+u(409)
+u(393)
+u(417)
+u(401)
+u(106)
+f(817,11,8,1)
+u(777)
+u(881)
+u(538)
+
+search();
+</script></body></html>
