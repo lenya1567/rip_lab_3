@@ -84,7 +84,7 @@ java -XX:StartFlightRecording=filename=profile.jfr -jar ./target/demo-0.0.1-SNAP
 |CPU usage|50%|
 |Total allocation|407 МБ|
 |Latency|1.11c|
-|GC pause time|1 мс|
+|GC pause time|30 мс|
 
 ## Выводы 
 
